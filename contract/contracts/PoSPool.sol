@@ -58,6 +58,7 @@ contract PoSPool is PoolContext, Ownable, Initializable {
     uint256 unlocked;
     uint256 claimedInterest;
     uint256 currentInterest;
+    uint256 period; // TODO: make sure this is backward compatible
   }
 
   struct PoolShot {
@@ -92,9 +93,22 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   // Free fee whitelist
   EnumerableSet.AddressSet private feeFreeWhiteList;
 
+  // register and force retire starts a new period
+  uint256 public currentPeriod;
+  bool public recoveryMode;
+
   // ======================== Modifiers =========================
   modifier onlyRegisted() {
     require(_poolRegisted, "Pool is not registed");
+    _;
+  }
+
+  modifier checkPeriod() {
+    if (_poolRegisted && !recoveryMode && totalPoSVotes() == 0) {
+      recoveryMode = true;
+      currentPeriod += 1;
+    }
+
     _;
   }
 
@@ -207,13 +221,14 @@ contract PoSPool is PoolContext, Ownable, Initializable {
     bytes calldata blsPubKey,
     bytes calldata vrfPubKey,
     bytes[2] calldata blsPubKeyProof
-  ) public virtual payable onlyOwner {
+  ) public virtual payable onlyOwner checkPeriod {
     require(!_poolRegisted, "Pool is already registed");
     require(votePower == 1, "votePower should be 1");
     require(msg.value == votePower * CFX_VALUE_OF_ONE_VOTE, "msg.value should be 1000 CFX");
     _stakingDeposit(msg.value);
     _posRegisterRegister(indentifier, votePower, blsPubKey, vrfPubKey, blsPubKeyProof);
     _poolRegisted = true;
+    recoveryMode = false;
 
     // update user info
     userSummaries[msg.sender].votes += votePower;
@@ -234,9 +249,13 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   /// @notice Increase PoS vote power
   /// @param votePower The number of vote power to increase
   ///
-  function increaseStake(uint64 votePower) public virtual payable onlyRegisted {
+  function increaseStake(uint64 votePower) public virtual payable onlyRegisted checkPeriod {
     require(votePower > 0, "Minimal votePower is 1");
     require(msg.value == votePower * CFX_VALUE_OF_ONE_VOTE, "msg.value should be votePower * 1000 ether");
+
+    if (userSummaries[msg.sender].period < currentPeriod && userSummaries[msg.sender].votes > 0) {
+      revert("Must retire stake first");
+    }
     
     _stakingDeposit(msg.value);
     _posRegisterIncreaseStake(votePower);
@@ -252,6 +271,7 @@ contract PoSPool is PoolContext, Ownable, Initializable {
     userSummaries[msg.sender].locked += userInqueues[msg.sender].collectEndedVotes();
     userSummaries[msg.sender].votes += votePower;
     userSummaries[msg.sender].available += votePower;
+    userSummaries[msg.sender].period = currentPeriod;
     _updateUserShot(msg.sender);
 
     stakers.add(msg.sender);
@@ -265,9 +285,12 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   /// @notice Decrease PoS vote power
   /// @param votePower The number of vote power to decrease
   ///
-  function decreaseStake(uint64 votePower) public virtual onlyRegisted {
+  function decreaseStake(uint64 votePower) public virtual onlyRegisted checkPeriod {
     userSummaries[msg.sender].locked += userInqueues[msg.sender].collectEndedVotes();
     require(userSummaries[msg.sender].locked >= votePower, "Locked is not enough");
+
+    // TODO: allow user to withdraw without retire
+
     _posRegisterRetire(votePower);
     emit DecreasePoSStake(msg.sender, votePower);
 
@@ -292,7 +315,7 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   /// @notice Withdraw PoS vote power
   /// @param votePower The number of vote power to withdraw
   ///
-  function withdrawStake(uint64 votePower) public onlyRegisted {
+  function withdrawStake(uint64 votePower) public onlyRegisted checkPeriod {
     userSummaries[msg.sender].unlocked += userOutqueues[msg.sender].collectEndedVotes();
     require(userSummaries[msg.sender].unlocked >= votePower, "Unlocked is not enough");
     _stakingWithdraw(votePower * CFX_VALUE_OF_ONE_VOTE);
@@ -338,7 +361,7 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   /// @notice Claim specific amount user interest
   /// @param amount The amount of interest to claim
   ///
-  function claimInterest(uint amount) public onlyRegisted {
+  function claimInterest(uint amount) public onlyRegisted checkPeriod {
     uint claimableInterest = userInterest(msg.sender);
     require(claimableInterest >= amount, "Interest not enough");
 
@@ -364,7 +387,7 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   ///
   /// @notice Claim one user's all interest
   ///
-  function claimAllInterest() public onlyRegisted {
+  function claimAllInterest() public onlyRegisted checkPeriod {
     uint claimableInterest = userInterest(msg.sender);
     require(claimableInterest > 0, "No claimable interest");
     claimInterest(claimableInterest);
@@ -415,6 +438,11 @@ contract PoSPool is PoolContext, Ownable, Initializable {
   ///
   function posAddress() public view onlyRegisted returns (bytes32) {
     return _posAddressToIdentifier(address(this));
+  }
+
+  function totalPoSVotes() public view onlyRegisted returns (uint256) {
+    (uint256 totalStaked, uint256 totalUnlocked) = _posGetVotes(posAddress());
+    return totalStaked - totalUnlocked;
   }
 
   function userInQueue(address account) public view returns (VotePowerQueue.QueueNode[] memory) {
